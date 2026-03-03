@@ -9,11 +9,70 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// ── Common browser-like User-Agent ────────────────────────────────────────────
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// ── Crumb / session cache ─────────────────────────────────────────────────────
+let crumbCache = null; // { crumb: string, cookie: string, fetchedAt: number }
+const CRUMB_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Obtain a Yahoo Finance crumb + session cookie required for authenticated API
+ * calls.  Results are cached for CRUMB_TTL_MS to avoid unnecessary round-trips.
+ *
+ * @returns {Promise<{ crumb: string, cookie: string }>}
+ */
+async function getYahooCrumb() {
+  const now = Date.now();
+  if (crumbCache && now - crumbCache.fetchedAt < CRUMB_TTL_MS) {
+    return crumbCache;
+  }
+
+  // Step 1: visit Yahoo Finance to acquire session cookies.
+  const homeRes = await axios.get('https://finance.yahoo.com', {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+    },
+    timeout: 15000,
+    maxRedirects: 5,
+  });
+
+  const rawCookies = homeRes.headers['set-cookie'] ?? [];
+  const cookie = rawCookies.map((c) => c.split(';')[0]).join('; ');
+
+  // Step 2: exchange cookies for a crumb token.
+  const crumbRes = await axios.get(
+    'https://query1.finance.yahoo.com/v1/test/getcrumb',
+    {
+      headers: {
+        'User-Agent': USER_AGENT,
+        Cookie: cookie,
+      },
+      timeout: 10000,
+    },
+  );
+
+  crumbCache = { crumb: String(crumbRes.data), cookie, fetchedAt: now };
+  return crumbCache;
+}
+
+/** Invalidate the crumb cache so the next request fetches a fresh crumb. */
+function invalidateCrumbCache() {
+  crumbCache = null;
+}
+
 // ── Yahoo Finance helper ──────────────────────────────────────────────────────
 
 /**
  * Fetch quote data for one or more tickers from Yahoo Finance v7 quote API.
- * Returns an array of shaped quote objects.
+ * Automatically obtains and caches the crumb + session cookie required by the
+ * Yahoo Finance API.  On a 401 response it invalidates the cache and retries
+ * once with fresh credentials.
  *
  * @param {string[]} symbols - Array of ticker symbols (e.g. ['AAPL', 'MSFT'])
  * @returns {Promise<Object[]>}
@@ -23,27 +82,47 @@ async function fetchQuotes(symbols) {
 
   const url = 'https://query1.finance.yahoo.com/v7/finance/quote';
 
-  const { data } = await axios.get(url, {
-    params: {
-      symbols: joined,
-      fields: [
-        'symbol',
-        'shortName',
-        'regularMarketPrice',
-        'regularMarketChangePercent',
-        'regularMarketVolume',
-        'marketCap',
-        'fiftyTwoWeekHigh',
-        'fiftyTwoWeekLow',
-        'currency',
-      ].join(','),
-    },
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (compatible; YahooFinanceProxy/1.0)',
-    },
-    timeout: 10000,
-  });
+  const doRequest = async () => {
+    const { crumb, cookie } = await getYahooCrumb();
+
+    return axios.get(url, {
+      params: {
+        symbols: joined,
+        crumb,
+        fields: [
+          'symbol',
+          'shortName',
+          'regularMarketPrice',
+          'regularMarketChangePercent',
+          'regularMarketVolume',
+          'marketCap',
+          'fiftyTwoWeekHigh',
+          'fiftyTwoWeekLow',
+          'currency',
+        ].join(','),
+      },
+      headers: {
+        'User-Agent': USER_AGENT,
+        Cookie: cookie,
+      },
+      timeout: 10000,
+    });
+  };
+
+  let response;
+  try {
+    response = await doRequest();
+  } catch (err) {
+    // On 401 the crumb/cookie have expired — refresh and retry once.
+    if (err.response?.status === 401) {
+      invalidateCrumbCache();
+      response = await doRequest();
+    } else {
+      throw err;
+    }
+  }
+
+  const { data } = response;
 
   const results = data?.quoteResponse?.result;
   if (!results || results.length === 0) {
