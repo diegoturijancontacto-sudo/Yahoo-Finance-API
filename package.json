@@ -1,7 +1,6 @@
 {
   "name": "yahoo-finance-api-proxy",
   "version": "1.0.0",
-  "description": "API Proxy financiero para Panel de Control",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -13,6 +12,5 @@
   },
   "engines": {
     "node": ">=20.0.0"
-  },
-  "license": "MIT"
+  }
 }
