@@ -1,13 +1,12 @@
 const express = require('express');
-const yahooFinance2 = require('yahoo-finance2').default; // Cambiamos la forma de importar
+const { YahooFinance } = require('yahoo-finance2'); // Importación limpia de la clase
 const cors = require('cors');
 
 const app = express();
-// En las versiones más recientes de la v3, 'default' ya es una instancia lista para usar
-// o requiere ser instanciada desde el objeto importado.
-const yahooFinance = yahooFinance2; 
-
 const PORT = process.env.PORT || 3000;
+
+// CREAMOS LA INSTANCIA AQUÍ (Esto es lo que pide el error)
+const yahooFinance = new YahooFinance(); 
 
 app.use(cors());
 app.use(express.json());
@@ -15,7 +14,7 @@ app.use(express.json());
 // ── Yahoo Finance helper ──────────────────────────────────────────────────────
 
 async function fetchQuotes(symbols) {
-  // Intentamos usar el método directamente desde la exportación por defecto
+  // Usamos la instancia que creamos arriba
   const results = await yahooFinance.quote(symbols);
   
   const quotesArray = Array.isArray(results) ? results : [results];
@@ -35,7 +34,7 @@ async function fetchQuotes(symbols) {
   }));
 }
 
-// ... (Resto de tus rutas: /api/quote, /api/history, /health) ...
+// ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/api/quote', async (req, res) => {
   const { symbols } = req.query;
@@ -50,6 +49,26 @@ app.get('/api/quote', async (req, res) => {
   }
 });
 
+app.get('/api/history/:symbol', async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const end = new Date();
+    const start = new Date();
+    start.setMonth(start.getMonth() - 3);
+
+    const result = await yahooFinance.historical(symbol, {
+      period1: start,
+      period2: end,
+      interval: '1d' 
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: 'Error en historial', detail: err.message });
+  }
+});
+
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
 app.listen(PORT, () => {
-  console.log(`Yahoo Finance Proxy corriendo en puerto ${PORT}`);
+  console.log(`Yahoo Finance Proxy (v3) corriendo en puerto ${PORT}`);
 });
