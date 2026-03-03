@@ -1,12 +1,19 @@
 const express = require('express');
 const cors = require('cors');
-// Importación directa del constructor de la versión 3
-const YahooFinance = require('yahoo-finance2').YahooFinance;
+// Importamos el módulo completo
+const yfModule = require('yahoo-finance2');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CREAMOS LA INSTANCIA DE FORMA EXPLÍCITA
+// Buscamos el constructor con "escáner" para no fallar
+const YahooFinance = yfModule.YahooFinance || yfModule.default?.YahooFinance;
+
+if (!YahooFinance) {
+  console.error("Error crítico: No se encontró el constructor YahooFinance");
+}
+
+// CREAMOS LA INSTANCIA
 const yahooFinance = new YahooFinance();
 
 app.use(cors());
@@ -39,8 +46,15 @@ app.get('/api/quote', async (req, res) => {
 
 app.get('/api/history/:symbol', async (req, res) => {
   try {
-    const result = await yahooFinance.historical(req.params.symbol, { 
-      period1: '2025-01-01' // Cambiado a 2025 para asegurar datos recientes
+    const { symbol } = req.params;
+    const end = new Date();
+    const start = new Date();
+    start.setMonth(start.getMonth() - 3);
+
+    const result = await yahooFinance.historical(symbol, {
+      period1: start,
+      period2: end,
+      interval: '1d' 
     });
     res.json(result);
   } catch (err) {
@@ -48,7 +62,7 @@ app.get('/api/history/:symbol', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', library: 'v3' }));
 
 app.listen(PORT, () => {
   console.log(`Servidor iniciado correctamente en puerto ${PORT}`);
