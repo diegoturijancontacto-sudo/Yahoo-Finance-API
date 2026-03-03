@@ -1,69 +1,266 @@
 const express = require('express');
+const axios = require('axios');
 const cors = require('cors');
-// Importamos el módulo completo
-const yfModule = require('yahoo-finance2');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Buscamos el constructor con "escáner" para no fallar
-const YahooFinance = yfModule.YahooFinance || yfModule.default?.YahooFinance;
-
-if (!YahooFinance) {
-  console.error("Error crítico: No se encontró el constructor YahooFinance");
-}
-
-// CREAMOS LA INSTANCIA
-const yahooFinance = new YahooFinance();
-
+// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ── Rutas ────────────────────────────────────────────────────────────────────
+// ── Common browser-like User-Agent ────────────────────────────────────────────
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// ── Crumb / session cache ─────────────────────────────────────────────────────
+let crumbCache = null; // { crumb: string, cookie: string, fetchedAt: number }
+const CRUMB_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Obtain a Yahoo Finance crumb + session cookie required for authenticated API
+ * calls.  Results are cached for CRUMB_TTL_MS to avoid unnecessary round-trips.
+ *
+ * @returns {Promise<{ crumb: string, cookie: string }>}
+ */
+async function getYahooCrumb() {
+  const now = Date.now();
+  if (crumbCache && now - crumbCache.fetchedAt < CRUMB_TTL_MS) {
+    return crumbCache;
+  }
+
+  // Step 1: visit Yahoo Finance to acquire session cookies.
+  const homeRes = await axios.get('https://finance.yahoo.com', {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+    },
+    timeout: 15000,
+    maxRedirects: 5,
+  });
+
+  const rawCookies = homeRes.headers['set-cookie'] ?? [];
+  const cookie = rawCookies.map((c) => c.split(';')[0]).join('; ');
+
+  // Step 2: exchange cookies for a crumb token.
+  const crumbRes = await axios.get(
+    'https://query1.finance.yahoo.com/v1/test/getcrumb',
+    {
+      headers: {
+        'User-Agent': USER_AGENT,
+        Cookie: cookie,
+      },
+      timeout: 10000,
+    },
+  );
+
+  crumbCache = { crumb: String(crumbRes.data), cookie, fetchedAt: now };
+  return crumbCache;
+}
+
+/** Invalidate the crumb cache so the next request fetches a fresh crumb. */
+function invalidateCrumbCache() {
+  crumbCache = null;
+}
+
+// ── Yahoo Finance helper ──────────────────────────────────────────────────────
+
+/**
+ * Fetch quote data for one or more tickers from Yahoo Finance v7 quote API.
+ * Automatically obtains and caches the crumb + session cookie required by the
+ * Yahoo Finance API.  On a 401 response it invalidates the cache and retries
+ * once with fresh credentials.
+ *
+ * @param {string[]} symbols - Array of ticker symbols (e.g. ['AAPL', 'MSFT'])
+ * @returns {Promise<Object[]>}
+ */
+async function fetchQuotes(symbols) {
+  const joined = symbols.map((s) => s.toUpperCase().trim()).join(',');
+
+  const url = 'https://query1.finance.yahoo.com/v7/finance/quote';
+
+  const doRequest = async () => {
+    const { crumb, cookie } = await getYahooCrumb();
+
+    return axios.get(url, {
+      params: {
+        symbols: joined,
+        crumb,
+        fields: [
+          'symbol',
+          'shortName',
+          'regularMarketPrice',
+          'regularMarketChangePercent',
+          'regularMarketVolume',
+          'marketCap',
+          'fiftyTwoWeekHigh',
+          'fiftyTwoWeekLow',
+          'currency',
+        ].join(','),
+      },
+      headers: {
+        'User-Agent': USER_AGENT,
+        Cookie: cookie,
+      },
+      timeout: 10000,
+    });
+  };
+
+  let response;
+  try {
+    response = await doRequest();
+  } catch (err) {
+    // On 401 the crumb/cookie have expired — refresh and retry once.
+    if (err.response?.status === 401) {
+      invalidateCrumbCache();
+      response = await doRequest();
+    } else {
+      throw err;
+    }
+  }
+
+  const { data } = response;
+
+  const results = data?.quoteResponse?.result;
+  if (!results || results.length === 0) {
+    return [];
+  }
+
+  // ── Data Shaping ─────────────────────────────────────────────────────────
+  return results.map((q) => ({
+    symbol: q.symbol ?? null,
+    name: q.shortName ?? null,
+    price: q.regularMarketPrice ?? null,
+    changePercent: q.regularMarketChangePercent != null
+      ? parseFloat(q.regularMarketChangePercent.toFixed(2))
+      : null,
+    volume: q.regularMarketVolume ?? null,
+    marketCap: q.marketCap ?? null,
+    week52High: q.fiftyTwoWeekHigh ?? null,
+    week52Low: q.fiftyTwoWeekLow ?? null,
+    currency: q.currency ?? null,
+  }));
+}
+
+// ── Shared error handler ──────────────────────────────────────────────────────
+
+/**
+ * Handle errors from Yahoo Finance requests and send a consistent 502 response.
+ * Using 502 (Bad Gateway) for all upstream errors is semantically correct because
+ * the proxy received an invalid/unexpected response from the upstream service.
+ */
+function handleUpstreamError(err, res) {
+  const message =
+    err.response?.data?.quoteResponse?.error?.description ??
+    err.message ??
+    'Unexpected error while contacting Yahoo Finance.';
+
+  return res.status(502).json({
+    error: 'Failed to fetch data from Yahoo Finance.',
+    detail: message,
+  });
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/quote?symbols=AAPL,MSFT,GOOGL
+ *
+ * Supports batch requests: pass a comma-separated list of ticker symbols.
+ * Returns an array of shaped quote objects.
+ */
 app.get('/api/quote', async (req, res) => {
   const { symbols } = req.query;
-  if (!symbols) return res.status(400).json({ error: 'Faltan símbolos' });
-  const symbolList = symbols.split(',').map((s) => s.trim().toUpperCase());
 
-  try {
-    const results = await yahooFinance.quote(symbolList);
-    const quotesArray = Array.isArray(results) ? results : [results];
-
-    const shapedData = quotesArray.map((q) => ({
-      symbol: q.symbol,
-      name: q.shortName,
-      price: q.regularMarketPrice,
-      changePercent: q.regularMarketChangePercent?.toFixed(2),
-      currency: q.currency
-    }));
-
-    return res.json({ quotes: shapedData });
-  } catch (err) {
-    return res.status(502).json({ error: 'Error en Yahoo', detail: err.message });
-  }
-});
-
-app.get('/api/history/:symbol', async (req, res) => {
-  try {
-    const { symbol } = req.params;
-    const end = new Date();
-    const start = new Date();
-    start.setMonth(start.getMonth() - 3);
-
-    const result = await yahooFinance.historical(symbol, {
-      period1: start,
-      period2: end,
-      interval: '1d' 
+  if (!symbols) {
+    return res.status(400).json({
+      error: 'Missing required query parameter: symbols',
+      example: '/api/quote?symbols=AAPL,MSFT,GOOGL',
     });
-    res.json(result);
+  }
+
+  const symbolList = symbols
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (symbolList.length === 0) {
+    return res.status(400).json({ error: 'No valid symbols provided.' });
+  }
+
+  try {
+    const quotes = await fetchQuotes(symbolList);
+
+    if (quotes.length === 0) {
+      return res.status(404).json({
+        error: 'No data found for the provided symbols.',
+        symbols: symbolList,
+      });
+    }
+
+    return res.json({ quotes });
   } catch (err) {
-    res.status(502).json({ error: 'Error en historial', detail: err.message });
+    return handleUpstreamError(err, res);
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', library: 'v3' }));
+/**
+ * POST /api/quote
+ * Body: { "symbols": ["AAPL", "MSFT", "GOOGL"] }
+ *
+ * Alternative batch endpoint that accepts symbols in the request body.
+ */
+app.post('/api/quote', async (req, res) => {
+  const { symbols } = req.body ?? {};
 
-app.listen(PORT, () => {
-  console.log(`Servidor iniciado correctamente en puerto ${PORT}`);
+  if (!symbols || !Array.isArray(symbols) || symbols.length === 0) {
+    return res.status(400).json({
+      error: 'Request body must contain a non-empty "symbols" array.',
+      example: { symbols: ['AAPL', 'MSFT', 'GOOGL'] },
+    });
+  }
+
+  const symbolList = symbols.map((s) => String(s).trim()).filter(Boolean);
+
+  try {
+    const quotes = await fetchQuotes(symbolList);
+
+    if (quotes.length === 0) {
+      return res.status(404).json({
+        error: 'No data found for the provided symbols.',
+        symbols: symbolList,
+      });
+    }
+
+    return res.json({ quotes });
+  } catch (err) {
+    return handleUpstreamError(err, res);
+  }
 });
+
+/**
+ * GET /health
+ *
+ * Simple health-check endpoint.
+ */
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ── 404 catch-all ─────────────────────────────────────────────────────────────
+app.use((_req, res) => {
+  res.status(404).json({ error: 'Route not found.' });
+});
+
+// ── Start server ──────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`Yahoo Finance Proxy running on port ${PORT}`);
+  console.log(`  GET  /api/quote?symbols=AAPL,MSFT`);
+  console.log(`  POST /api/quote  { "symbols": ["AAPL","MSFT"] }`);
+  console.log(`  GET  /health`);
+});
+
+module.exports = app; // exported for testing
