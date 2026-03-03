@@ -1,6 +1,6 @@
 const express = require('express');
-const axios = require('axios');
 const cors = require('cors');
+const yahooFinance = require('yahoo-finance2').default;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,86 +9,18 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ── Common browser-like User-Agent ────────────────────────────────────────────
-const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-// ── Crumb / session cache ─────────────────────────────────────────────────────
-let crumbCache = null; // { crumb: string, cookie: string, fetchedAt: number }
-const CRUMB_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-/**
- * Obtain a Yahoo Finance crumb + session cookie required for authenticated API
- * calls.  Results are cached for CRUMB_TTL_MS to avoid unnecessary round-trips.
- *
- * @returns {Promise<{ crumb: string, cookie: string }>}
- */
-async function getYahooCrumb() {
-  const now = Date.now();
-  if (crumbCache && now - crumbCache.fetchedAt < CRUMB_TTL_MS) {
-    return crumbCache;
-  }
-
-  // Step 1: visit Yahoo Finance to acquire session cookies.
-  const homeRes = await axios.get('https://finance.yahoo.com', {
-    headers: {
-      'User-Agent': USER_AGENT,
-      Accept:
-        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-    },
-    timeout: 15000,
-    maxRedirects: 5,
-  });
-
-  const rawCookies = homeRes.headers['set-cookie'] ?? [];
-  const cookie = rawCookies.map((c) => c.split(';')[0]).join('; ');
-
-  // Step 2: exchange cookies for a crumb token.
-  const crumbRes = await axios.get(
-    'https://query1.finance.yahoo.com/v1/test/getcrumb',
-    {
-      headers: {
-        'User-Agent': USER_AGENT,
-        Cookie: cookie,
-      },
-      timeout: 10000,
-    },
-  );
-
-  crumbCache = { crumb: String(crumbRes.data), cookie, fetchedAt: now };
-  return crumbCache;
-}
-
-/** Invalidate the crumb cache so the next request fetches a fresh crumb. */
-function invalidateCrumbCache() {
-  crumbCache = null;
-}
-
 // ── Yahoo Finance helper ──────────────────────────────────────────────────────
 
 /**
- * Fetch quote data for one or more tickers from Yahoo Finance v7 quote API.
- * Automatically obtains and caches the crumb + session cookie required by the
- * Yahoo Finance API.  On a 401 response it invalidates the cache and retries
- * once with fresh credentials.
+ * Fetch quote data for one or more tickers using yahoo-finance2.
  *
  * @param {string[]} symbols - Array of ticker symbols (e.g. ['AAPL', 'MSFT'])
  * @returns {Promise<Object[]>}
  */
 async function fetchQuotes(symbols) {
-  const joined = symbols.map((s) => s.toUpperCase().trim()).join(',');
-
-  const url = 'https://query1.finance.yahoo.com/v7/finance/quote';
-
-  const doRequest = async () => {
-    const { crumb, cookie } = await getYahooCrumb();
-
-    return axios.get(url, {
-      params: {
-        symbols: joined,
-        crumb,
+  const results = await Promise.all(
+    symbols.map((s) =>
+      yahooFinance.quote(s.toUpperCase().trim(), {
         fields: [
           'symbol',
           'shortName',
@@ -99,50 +31,28 @@ async function fetchQuotes(symbols) {
           'fiftyTwoWeekHigh',
           'fiftyTwoWeekLow',
           'currency',
-        ].join(','),
-      },
-      headers: {
-        'User-Agent': USER_AGENT,
-        Cookie: cookie,
-      },
-      timeout: 10000,
-    });
-  };
-
-  let response;
-  try {
-    response = await doRequest();
-  } catch (err) {
-    // On 401 the crumb/cookie have expired — refresh and retry once.
-    if (err.response?.status === 401) {
-      invalidateCrumbCache();
-      response = await doRequest();
-    } else {
-      throw err;
-    }
-  }
-
-  const { data } = response;
-
-  const results = data?.quoteResponse?.result;
-  if (!results || results.length === 0) {
-    return [];
-  }
+        ],
+      }).catch(() => null),
+    ),
+  );
 
   // ── Data Shaping ─────────────────────────────────────────────────────────
-  return results.map((q) => ({
-    symbol: q.symbol ?? null,
-    name: q.shortName ?? null,
-    price: q.regularMarketPrice ?? null,
-    changePercent: q.regularMarketChangePercent != null
-      ? parseFloat(q.regularMarketChangePercent.toFixed(2))
-      : null,
-    volume: q.regularMarketVolume ?? null,
-    marketCap: q.marketCap ?? null,
-    week52High: q.fiftyTwoWeekHigh ?? null,
-    week52Low: q.fiftyTwoWeekLow ?? null,
-    currency: q.currency ?? null,
-  }));
+  return results
+    .filter(Boolean)
+    .map((q) => ({
+      symbol: q.symbol ?? null,
+      name: q.shortName ?? null,
+      price: q.regularMarketPrice ?? null,
+      changePercent:
+        q.regularMarketChangePercent != null
+          ? parseFloat(q.regularMarketChangePercent.toFixed(2))
+          : null,
+      volume: q.regularMarketVolume ?? null,
+      marketCap: q.marketCap ?? null,
+      week52High: q.fiftyTwoWeekHigh ?? null,
+      week52Low: q.fiftyTwoWeekLow ?? null,
+      currency: q.currency ?? null,
+    }));
 }
 
 // ── Shared error handler ──────────────────────────────────────────────────────
@@ -153,10 +63,7 @@ async function fetchQuotes(symbols) {
  * the proxy received an invalid/unexpected response from the upstream service.
  */
 function handleUpstreamError(err, res) {
-  const message =
-    err.response?.data?.quoteResponse?.error?.description ??
-    err.message ??
-    'Unexpected error while contacting Yahoo Finance.';
+  const message = err.message ?? 'Unexpected error while contacting Yahoo Finance.';
 
   return res.status(502).json({
     error: 'Failed to fetch data from Yahoo Finance.',
