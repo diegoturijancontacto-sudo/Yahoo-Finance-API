@@ -1,173 +1,75 @@
 const express = require('express');
+const { YahooFinance } = require('yahoo-finance2'); // Cambio aquí
 const cors = require('cors');
-const yahooFinance = require('yahoo-finance2').default;
 
 const app = express();
+const yahooFinance = new YahooFinance(); // Instanciar la clase aquí
 const PORT = process.env.PORT || 3000;
 
-// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
 // ── Yahoo Finance helper ──────────────────────────────────────────────────────
 
-/**
- * Fetch quote data for one or more tickers using yahoo-finance2.
- *
- * @param {string[]} symbols - Array of ticker symbols (e.g. ['AAPL', 'MSFT'])
- * @returns {Promise<Object[]>}
- */
 async function fetchQuotes(symbols) {
-  const results = await Promise.all(
-    symbols.map((s) =>
-      yahooFinance.quote(s.toUpperCase().trim(), {
-        fields: [
-          'symbol',
-          'shortName',
-          'regularMarketPrice',
-          'regularMarketChangePercent',
-          'regularMarketVolume',
-          'marketCap',
-          'fiftyTwoWeekHigh',
-          'fiftyTwoWeekLow',
-          'currency',
-        ],
-      }).catch(() => null),
-    ),
-  );
+  // Ahora usamos la instancia 'yahooFinance'
+  const results = await yahooFinance.quote(symbols);
+  
+  const quotesArray = Array.isArray(results) ? results : [results];
 
-  // ── Data Shaping ─────────────────────────────────────────────────────────
-  return results
-    .filter(Boolean)
-    .map((q) => ({
-      symbol: q.symbol ?? null,
-      name: q.shortName ?? null,
-      price: q.regularMarketPrice ?? null,
-      changePercent:
-        q.regularMarketChangePercent != null
-          ? parseFloat(q.regularMarketChangePercent.toFixed(2))
-          : null,
-      volume: q.regularMarketVolume ?? null,
-      marketCap: q.marketCap ?? null,
-      week52High: q.fiftyTwoWeekHigh ?? null,
-      week52Low: q.fiftyTwoWeekLow ?? null,
-      currency: q.currency ?? null,
-    }));
+  return quotesArray.map((q) => ({
+    symbol: q.symbol ?? null,
+    name: q.shortName ?? null,
+    price: q.regularMarketPrice ?? null,
+    changePercent: q.regularMarketChangePercent != null
+      ? parseFloat(q.regularMarketChangePercent.toFixed(2))
+      : null,
+    volume: q.regularMarketVolume ?? null,
+    marketCap: q.marketCap ?? null,
+    week52High: q.fiftyTwoWeekHigh ?? null,
+    week52Low: q.fiftyTwoWeekLow ?? null,
+    currency: q.currency ?? null,
+  }));
 }
 
-// ── Shared error handler ──────────────────────────────────────────────────────
+// ── Rutas ────────────────────────────────────────────────────────────────────
 
-/**
- * Handle errors from Yahoo Finance requests and send a consistent 502 response.
- * Using 502 (Bad Gateway) for all upstream errors is semantically correct because
- * the proxy received an invalid/unexpected response from the upstream service.
- */
-function handleUpstreamError(err, res) {
-  const message = err.message ?? 'Unexpected error while contacting Yahoo Finance.';
-
-  return res.status(502).json({
-    error: 'Failed to fetch data from Yahoo Finance.',
-    detail: message,
-  });
-}
-
-// ── Routes ────────────────────────────────────────────────────────────────────
-
-/**
- * GET /api/quote?symbols=AAPL,MSFT,GOOGL
- *
- * Supports batch requests: pass a comma-separated list of ticker symbols.
- * Returns an array of shaped quote objects.
- */
 app.get('/api/quote', async (req, res) => {
   const { symbols } = req.query;
+  if (!symbols) return res.status(400).json({ error: 'Faltan símbolos' });
 
-  if (!symbols) {
-    return res.status(400).json({
-      error: 'Missing required query parameter: symbols',
-      example: '/api/quote?symbols=AAPL,MSFT,GOOGL',
-    });
-  }
-
-  const symbolList = symbols
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (symbolList.length === 0) {
-    return res.status(400).json({ error: 'No valid symbols provided.' });
-  }
+  const symbolList = symbols.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 
   try {
     const quotes = await fetchQuotes(symbolList);
-
-    if (quotes.length === 0) {
-      return res.status(404).json({
-        error: 'No data found for the provided symbols.',
-        symbols: symbolList,
-      });
-    }
-
     return res.json({ quotes });
   } catch (err) {
-    return handleUpstreamError(err, res);
-  }
-});
-
-/**
- * POST /api/quote
- * Body: { "symbols": ["AAPL", "MSFT", "GOOGL"] }
- *
- * Alternative batch endpoint that accepts symbols in the request body.
- */
-app.post('/api/quote', async (req, res) => {
-  const { symbols } = req.body ?? {};
-
-  if (!symbols || !Array.isArray(symbols) || symbols.length === 0) {
-    return res.status(400).json({
-      error: 'Request body must contain a non-empty "symbols" array.',
-      example: { symbols: ['AAPL', 'MSFT', 'GOOGL'] },
+    return res.status(502).json({
+      error: 'Error al conectar con Yahoo Finance',
+      detail: err.message,
     });
   }
+});
 
-  const symbolList = symbols.map((s) => String(s).trim()).filter(Boolean);
+// Ruta de historial actualizada
+app.get('/api/history/:symbol', async (req, res) => {
+    try {
+        const { symbol } = req.params;
+        const end = new Date();
+        const start = new Date();
+        start.setMonth(start.getMonth() - 3);
 
-  try {
-    const quotes = await fetchQuotes(symbolList);
-
-    if (quotes.length === 0) {
-      return res.status(404).json({
-        error: 'No data found for the provided symbols.',
-        symbols: symbolList,
-      });
+        const result = await yahooFinance.historical(symbol, {
+            period1: start,
+            period2: end,
+            interval: '1d' 
+        });
+        res.json(result);
+    } catch (err) {
+        res.status(502).json({ error: 'Error en historial', detail: err.message });
     }
-
-    return res.json({ quotes });
-  } catch (err) {
-    return handleUpstreamError(err, res);
-  }
 });
 
-/**
- * GET /health
- *
- * Simple health-check endpoint.
- */
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// ── 404 catch-all ─────────────────────────────────────────────────────────────
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Route not found.' });
-});
-
-// ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Yahoo Finance Proxy running on port ${PORT}`);
-  console.log(`  GET  /api/quote?symbols=AAPL,MSFT`);
-  console.log(`  POST /api/quote  { "symbols": ["AAPL","MSFT"] }`);
-  console.log(`  GET  /health`);
+  console.log(`Servidor activo en puerto ${PORT}`);
 });
-
-module.exports = app; // exported for testing
