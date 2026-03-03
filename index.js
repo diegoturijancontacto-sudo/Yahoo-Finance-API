@@ -1,12 +1,19 @@
 const express = require('express');
-const { YahooFinance } = require('yahoo-finance2'); // Importación limpia de la clase
+const yf = require('yahoo-finance2'); // Importamos todo el módulo
 const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CREAMOS LA INSTANCIA AQUÍ (Esto es lo que pide el error)
-const yahooFinance = new YahooFinance(); 
+// Buscamos el constructor de forma segura
+const YahooFinanceClass = yf.YahooFinance || yf.default?.YahooFinance;
+
+if (!YahooFinanceClass) {
+  console.error("No se pudo encontrar el constructor YahooFinance. Revisa la versión de la librería.");
+}
+
+// CREAMOS LA INSTANCIA
+const yahooFinance = new YahooFinanceClass(); 
 
 app.use(cors());
 app.use(express.json());
@@ -14,9 +21,7 @@ app.use(express.json());
 // ── Yahoo Finance helper ──────────────────────────────────────────────────────
 
 async function fetchQuotes(symbols) {
-  // Usamos la instancia que creamos arriba
   const results = await yahooFinance.quote(symbols);
-  
   const quotesArray = Array.isArray(results) ? results : [results];
 
   return quotesArray.map((q) => ({
