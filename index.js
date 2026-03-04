@@ -145,6 +145,111 @@ async function fetchQuotes(symbols) {
   }));
 }
 
+// ── Yahoo Finance history helper ──────────────────────────────────────────────
+
+/**
+ * Valid range / interval values accepted by the Yahoo Finance chart API.
+ */
+const VALID_RANGES = new Set([
+  '1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', 'ytd', 'max',
+]);
+const VALID_INTERVALS = new Set([
+  '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h',
+  '1d', '5d', '1wk', '1mo', '3mo',
+]);
+
+/**
+ * Fetch OHLCV historical data for a single ticker from Yahoo Finance v8 chart API.
+ * Automatically obtains and caches the crumb + session cookie.
+ * On a 401 response it invalidates the cache and retries once with fresh credentials.
+ *
+ * @param {string} symbol   - Ticker symbol (e.g. 'AAPL')
+ * @param {string} range    - Date range (e.g. '1y', '6mo', 'max') — default '1y'
+ * @param {string} interval - Data interval (e.g. '1d', '1wk')     — default '1d'
+ * @returns {Promise<Object>}
+ */
+async function fetchHistory(symbol, range = '1y', interval = '1d') {
+  const ticker = symbol.toUpperCase().trim();
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`;
+
+  const doRequest = async () => {
+    const { crumb, cookie } = await getYahooCrumb();
+
+    return axios.get(url, {
+      params: { range, interval, crumb, includeAdjustedClose: true },
+      headers: {
+        'User-Agent': USER_AGENT,
+        Cookie: cookie,
+      },
+      timeout: 15000,
+    });
+  };
+
+  let response;
+  try {
+    response = await doRequest();
+  } catch (err) {
+    if (err.response?.status === 401) {
+      invalidateCrumbCache();
+      response = await doRequest();
+    } else {
+      throw err;
+    }
+  }
+
+  const chart = response.data?.chart;
+  if (chart?.error) {
+    const e = new Error(chart.error.description ?? 'Yahoo Finance chart error');
+    e.yahooError = chart.error;
+    throw e;
+  }
+
+  const result = chart?.result?.[0];
+  if (!result) {
+    return null;
+  }
+
+  const timestamps = result.timestamp ?? [];
+  const quote = result.indicators?.quote?.[0] ?? {};
+  const adjClose = result.indicators?.adjclose?.[0]?.adjclose ?? [];
+  const meta = result.meta ?? {};
+
+  // Shape into an array of candle objects, filtering out entries with null OHLCV.
+  const candles = timestamps.reduce((acc, ts, i) => {
+    const open  = quote.open?.[i];
+    const high  = quote.high?.[i];
+    const low   = quote.low?.[i];
+    const close = quote.close?.[i];
+    const volume = quote.volume?.[i];
+
+    if (open == null || high == null || low == null || close == null) {
+      return acc;
+    }
+
+    acc.push({
+      date: new Date(ts * 1000).toISOString(),
+      open:  parseFloat(open.toFixed(4)),
+      high:  parseFloat(high.toFixed(4)),
+      low:   parseFloat(low.toFixed(4)),
+      close: parseFloat(close.toFixed(4)),
+      adjClose: adjClose[i] != null ? parseFloat(adjClose[i].toFixed(4)) : null,
+      volume: volume ?? null,
+    });
+
+    return acc;
+  }, []);
+
+  return {
+    symbol: meta.symbol ?? ticker,
+    currency: meta.currency ?? null,
+    exchangeName: meta.exchangeName ?? null,
+    instrumentType: meta.instrumentType ?? null,
+    range,
+    interval,
+    candles,
+  };
+}
+
 // ── Shared error handler ──────────────────────────────────────────────────────
 
 /**
@@ -155,6 +260,7 @@ async function fetchQuotes(symbols) {
 function handleUpstreamError(err, res) {
   const message =
     err.response?.data?.quoteResponse?.error?.description ??
+    err.yahooError?.description ??
     err.message ??
     'Unexpected error while contacting Yahoo Finance.';
 
@@ -242,6 +348,59 @@ app.post('/api/quote', async (req, res) => {
 });
 
 /**
+ * GET /api/history?symbol=AAPL&range=1y&interval=1d
+ *
+ * Returns OHLCV candle data suitable for charting libraries.
+ *
+ * Query parameters:
+ *   symbol   {string}  required – ticker symbol (e.g. AAPL)
+ *   range    {string}  optional – date range (default: 1y)
+ *                      allowed : 1d | 5d | 1mo | 3mo | 6mo | 1y | 2y | 5y | 10y | ytd | max
+ *   interval {string}  optional – candle interval (default: 1d)
+ *                      allowed : 1m | 2m | 5m | 15m | 30m | 60m | 90m | 1h |
+ *                                1d | 5d | 1wk | 1mo | 3mo
+ */
+app.get('/api/history', async (req, res) => {
+  const { symbol, range = '1y', interval = '1d' } = req.query;
+
+  if (!symbol) {
+    return res.status(400).json({
+      error: 'Missing required query parameter: symbol',
+      example: '/api/history?symbol=AAPL&range=1y&interval=1d',
+    });
+  }
+
+  if (!VALID_RANGES.has(range)) {
+    return res.status(400).json({
+      error: `Invalid range "${range}".`,
+      allowed: [...VALID_RANGES],
+    });
+  }
+
+  if (!VALID_INTERVALS.has(interval)) {
+    return res.status(400).json({
+      error: `Invalid interval "${interval}".`,
+      allowed: [...VALID_INTERVALS],
+    });
+  }
+
+  try {
+    const history = await fetchHistory(symbol, range, interval);
+
+    if (!history) {
+      return res.status(404).json({
+        error: 'No historical data found for the provided symbol.',
+        symbol,
+      });
+    }
+
+    return res.json(history);
+  } catch (err) {
+    return handleUpstreamError(err, res);
+  }
+});
+
+/**
  * GET /health
  *
  * Simple health-check endpoint.
@@ -260,6 +419,7 @@ app.listen(PORT, () => {
   console.log(`Yahoo Finance Proxy running on port ${PORT}`);
   console.log(`  GET  /api/quote?symbols=AAPL,MSFT`);
   console.log(`  POST /api/quote  { "symbols": ["AAPL","MSFT"] }`);
+  console.log(`  GET  /api/history?symbol=AAPL&range=1y&interval=1d`);
   console.log(`  GET  /health`);
 });
 
