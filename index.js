@@ -10,9 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // ── Common browser-like User-Agent ────────────────────────────────────────────
-const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${110 + Math.floor(Math.random() * 10)}.0.0.0 Safari/537.36`;
 
 // ── Crumb / session cache ─────────────────────────────────────────────────────
 let crumbCache = null; // { crumb: string, cookie: string, fetchedAt: number }
